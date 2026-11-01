@@ -257,9 +257,6 @@ async fn templates_list(core: Ctx<'_>, _: Empty) -> Result<TemplatesResult, RpcE
 }
 
 async fn terminal_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcError> {
-    // Asked from another machine: only ours. Two machines that added each
-    // other would otherwise ask each other back until the timeout.
-    let afar = from_afar(core);
     let (mut terminals, mut hidden_finished, machines) = {
         let mut st = core.lock();
         core.prune(&mut st);
@@ -272,14 +269,45 @@ async fn terminal_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcEr
         let hidden = if p.all { 0 } else { matching.iter().filter(|t| !t.is_live()).count() };
         let terminals: Vec<serde_json::Value> =
             matching.into_iter().filter(|t| p.all || t.is_live()).cloned().map(|t| json!(Public(t))).collect();
-        let machines = if afar { Vec::new() } else { st.machines.clone() };
+        let machines = st.machines.clone();
         (terminals, hidden, machines)
     };
+    // `personal:` A local caller always sees the machines added here (the
+    // stock star). Asked from another machine, that stops here as it always
+    // did — two machines that added each other must not ask each other for
+    // good — unless this is a mesh call (`names` says where it started, and
+    // `seen` says where it has been).
+    let mesh = crate::config::load(&core.paths.config).unwrap_or_default().mesh_depth();
+    let aggregating = !from_afar(core) || !p.names.is_empty();
+    let onward = p.depth + 1 < mesh && aggregating;
+    // From the core that asked: the core ids already reached on the way here,
+    // and what each machine is called there. A machine further out keeps the
+    // name it was first seen under.
+    let mut names = p.names.clone();
+    for m in &machines {
+        names.entry(m.name.clone()).or_insert_with(|| m.name.clone());
+    }
+    // The cores this list has been asked of so far, this one included. A
+    // machine already there is the way back, not a machine to add: asking it
+    // would ask this core again.
+    let mut seen: std::collections::BTreeSet<String> = p.seen.iter().cloned().collect();
+    seen.insert(core.info.id.clone());
+    // A machine already asked on the way here is the way back, not a machine
+    // to ask again.
+    let ask = machines.iter().filter(|m| aggregating && !seen.contains(&m.id));
     // Each machine at once, each given a moment: a slow one never holds up the list.
-    let asks: Vec<_> = machines
-        .iter()
+    let ask_params = {
+        let mut params = serde_json::to_value(&p).unwrap_or_default();
+        if onward {
+            params["depth"] = (p.depth + 1).into();
+            params["names"] = serde_json::to_value(&names).unwrap_or_default();
+            params["seen"] = serde_json::to_value(&seen).unwrap_or_default();
+        }
+        params
+    };
+    let asks: Vec<_> = ask
         .map(|m| {
-            let (core, m, params) = (core.core.clone(), m.clone(), serde_json::to_value(&p).unwrap_or_default());
+            let (core, m, params) = (core.core.clone(), m.clone(), ask_params.clone());
             tokio::spawn(async move {
                 let ask = crate::remote::forward(&core, &m, "terminal.list", params);
                 tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok)
@@ -292,12 +320,55 @@ async fn terminal_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcEr
             hidden_finished += r["hidden_finished"].as_u64().unwrap_or(0) as usize;
         }
     }
-    let machines = {
+    let machines: Vec<crate::remote::MachineView> = {
         let st = core.lock();
         machines.iter().map(|m| crate::remote::view(&st, m)).collect()
     };
+    // `personal:` One record per terminal: two ways to the same machine (a
+    // mesh has diamonds) must not list it twice, and a way that comes back to
+    // a terminal here is that terminal, by its bare address.
+    let mine = self_prefixes(core);
+    dedupe(&mut terminals, &mine);
     core.flush_saved().await?;
     Ok(ListResult { terminals, hidden_finished, machines })
+}
+
+/// `personal:` How this core can be named in an address, and so is itself.
+fn self_prefixes(core: Ctx<'_>) -> Vec<String> {
+    vec![core.core.info.id.clone(), core.core.info.name.clone()]
+}
+
+/// `personal:` One entry per terminal, in place: a record whose prefix names
+/// this core is the local terminal under its bare address, and a terminal
+/// already listed under that address is dropped.
+fn dedupe(terminals: &mut Vec<serde_json::Value>, mine: &[String]) {
+    let bare = |t: &serde_json::Value| t["address"].as_str().map(String::from).unwrap_or_default();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(terminals.len());
+    for mut t in terminals.drain(..) {
+        let address = bare(&t);
+        let (prefix, local) = address.split_once('/').unwrap_or(("", address.as_str()));
+        if !prefix.is_empty()
+            && mine.iter().any(|m| m == prefix)
+            && let Some(o) = t.as_object_mut()
+        {
+            o.insert("address".into(), local.into());
+            let parent = o.get("parent").and_then(|p| p.as_str()).map(String::from);
+            if let Some(rest) = parent
+                .as_deref()
+                .and_then(|p| p.split_once('/'))
+                .filter(|(p, _)| mine.iter().any(|m| m == p))
+                .map(|(_, rest)| rest)
+            {
+                o.insert("parent".into(), rest.into());
+            }
+        }
+        let address = bare(&t);
+        if seen.insert(address) {
+            out.push(t);
+        }
+    }
+    *terminals = out;
 }
 
 async fn terminal_get(core: Ctx<'_>, p: TerminalParams) -> Result<Public, RpcError> {
@@ -696,8 +767,45 @@ async fn machine_add(core: Ctx<'_>, p: MachineAddParams) -> Result<crate::machin
 }
 
 async fn machine_list(core: Ctx<'_>, _: Empty) -> Result<MachineListResult, RpcError> {
-    let st = core.lock();
-    Ok(MachineListResult { machines: st.machines.iter().map(|m| crate::remote::view(&st, m)).collect() })
+    // `personal:` A mesh shows what is past this core too, marked with the
+    // machine it was reached through. The stock star stops at what was added
+    // here (mesh_depth 0).
+    let mesh = crate::config::load(&core.paths.config).unwrap_or_default().mesh_depth();
+    let (machines, here) = {
+        let st = core.lock();
+        let machines = st.machines.iter().map(|m| crate::remote::view(&st, m)).collect();
+        (machines, core.info.id.clone())
+    };
+    let mut out: Vec<crate::remote::MachineView> = machines;
+    if mesh > 0 {
+        let asked: Vec<_> = out
+            .iter()
+            .filter(|v| v.state == "connected")
+            .map(|v| v.machine.clone())
+            .map(|m| {
+                let core = core.core.clone();
+                tokio::spawn(async move {
+                    let ask = crate::remote::forward(&core, &m, "machine.list", json!({}));
+                    let r = tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok);
+                    r.map(|r| (m, r))
+                })
+            })
+            .collect();
+        let mut seen: std::collections::BTreeSet<String> = out.iter().map(|v| v.machine.id.clone()).collect();
+        seen.insert(here);
+        for ask in asked {
+            let Ok(Some((via, r))) = ask.await else { continue };
+            for v in r["machines"].as_array().cloned().unwrap_or_default() {
+                let Ok(mut view) = serde_json::from_value::<crate::remote::MachineView>(v) else { continue };
+                if !seen.insert(view.machine.id.clone()) {
+                    continue;
+                }
+                view.through.get_or_insert_with(|| via.name.clone());
+                out.push(view);
+            }
+        }
+    }
+    Ok(MachineListResult { machines: out })
 }
 
 async fn machine_connect(core: Ctx<'_>, p: MachineParams) -> Result<crate::remote::MachineView, RpcError> {

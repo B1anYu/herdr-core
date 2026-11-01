@@ -8,7 +8,7 @@ use crate::rpc::RpcError;
 use crate::runtime::{Core, State, now_ms};
 use crate::wire::{self, Conn};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -194,7 +194,7 @@ pub enum LineState {
 }
 
 /// A machine as `machine ls` and `ls` show it: its profile and its line now.
-#[derive(Serialize, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone)]
 pub struct MachineView {
     #[serde(flatten)]
     pub machine: Machine,
@@ -205,6 +205,10 @@ pub struct MachineView {
     pub since_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// `personal:` The machine it was reached through, when it was not added
+    /// here (`sg` through `windows`). None: added here, or this core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through: Option<String>,
 }
 
 pub fn view(st: &State, m: &Machine) -> MachineView {
@@ -215,7 +219,7 @@ pub fn view(st: &State, m: &Machine) -> MachineView {
         Some(LineState::NeedsUpdate { since_ms }) => ("needs_update", Some(*since_ms), None),
         Some(LineState::Unreachable { since_ms, why }) => ("unreachable", Some(*since_ms), Some(why.clone())),
     };
-    MachineView { machine: m.clone(), state: state.into(), since_ms, why }
+    MachineView { machine: m.clone(), state: state.into(), since_ms, why, through: None }
 }
 
 fn reconnect_max() -> Duration {
@@ -1034,7 +1038,13 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
         _ => e,
     })?;
     // Document contents are opaque: address-shaped keys belong to the client.
-    let reply = if method.starts_with("doc.") { reply } else { localize(core, &m.name, &[], reply) };
+    // So are machines: a machine's name is its own, not an address to prefix
+    // (a mesh shows them as `via` instead).
+    let reply = if method.starts_with("doc.") || method == "machine.list" {
+        reply
+    } else {
+        localize(core, &m.name, &[], reply)
+    };
     // It started work there: its child may now call back and send it notes.
     if method == "terminal.run"
         && let Some(parent) = reply["parent"].as_str().and_then(crate::terminals::parse_id)

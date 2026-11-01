@@ -658,6 +658,13 @@
             "description": "Short-lived (a sandbox for a task): clients may show it apart from the\nmachines that stay. hc treats it like any other.",
             "type": "boolean"
           },
+          "through": {
+            "description": "`personal:` The machine it was reached through, when it was not added\nhere (`sg` through `windows`). None: added here, or this core.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "version": {
             "description": "Its hc version when last seen.",
             "type": "string"
@@ -2011,6 +2018,17 @@
           }
         },
         {
+          "description": "`personal:` How many more hops to reach past this core (0: just here).\nhc fills it in from `mesh_depth`; clients leave it out.",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "description": "`personal:` How many more hops to reach past this core (0: just here).\nhc fills it in from `mesh_depth`; clients leave it out.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
           "description": "Only terminals carrying all of these labels (repeatable).",
           "name": "labels",
           "required": false,
@@ -2021,6 +2039,30 @@
             "default": {},
             "description": "Only terminals carrying all of these labels (repeatable).",
             "type": "object"
+          }
+        },
+        {
+          "description": "`personal:` The name each machine added here goes by on the core that\nfirst asked, so a machine further out keeps the name it had there.",
+          "name": "names",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "`personal:` The name each machine added here goes by on the core that\nfirst asked, so a machine further out keeps the name it had there.",
+            "type": "object"
+          }
+        },
+        {
+          "description": "`personal:` The cores this list has already been asked of, by id: a\nmachine already there is the way back, and asking it would loop.",
+          "name": "seen",
+          "required": false,
+          "schema": {
+            "description": "`personal:` The cores this list has already been asked of, by id: a\nmachine already there is the way back, and asking it would loop.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         }
       ],

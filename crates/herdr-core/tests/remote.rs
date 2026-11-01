@@ -745,3 +745,77 @@ fn a_machine_that_drops_off_is_shown_not_waited_on_and_comes_back() {
     wait_until("rohan back", || s.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
     assert_eq!(addresses(&s.json(&["ls"])), ["rohan/t1"]);
 }
+
+/// `personal:` A mesh: `far` is reached only through `mid`, which `here`
+/// added. `lines` is how many hops `ls` may reach (0: the stock star).
+fn mesh_env(here: &mut Session, lines: u32) {
+    here.env.push(("HC_RECONNECT_MS".into(), "200".into()));
+    let path = here.root.join("config/herdr-core/config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("mesh_depth = {lines}\n")).unwrap();
+}
+
+#[test]
+fn a_mesh_lists_a_machine_it_only_reaches_through_another() {
+    let (far, mut mid, mut s) = (Session::new(), Session::new(), Session::new());
+    // s adds mid; mid adds far. s has no way to far at all.
+    s.env.push(fake_ssh(&s, &[("mid", &mid)]));
+    let (_, mid_ssh) = fake_ssh(&mid, &[("far", &far)]);
+    // `mid` runs under s's ssh script, so it names its own way to far: a
+    // command that reads like ssh (target, then the line to run there).
+    let via = mid.root.join("to-far");
+    std::fs::write(&via, format!("#!/bin/sh\nexec '{mid_ssh}' far \"$@\"\n")).unwrap();
+    std::fs::set_permissions(&via, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    mesh_env(&mut s, 2);
+    mesh_env(&mut mid, 2);
+    s.json(&["machine", "add", "mid"]);
+    mid.json(&["machine", "add", "--via", &via.display().to_string(), "--name", "far"]);
+    let local = run(&s, &["sleep", "100"]);
+    let there = run(&mid, &["sleep", "100"]);
+    let beyond = run(&far, &["sleep", "100"]);
+
+    // Through `mid`, the terminal on `far` keeps mid's name for it: `far/t1`.
+    let far_terminal = format!("far/{beyond}");
+    wait_until("far appears through mid", || {
+        let mut got = addresses(&s.json(&["ls"]));
+        got.sort();
+        got.contains(&far_terminal)
+    });
+    let mut got = addresses(&s.json(&["ls"]));
+    got.sort();
+    let mut want = vec![local, format!("mid/{there}"), far_terminal];
+    want.sort();
+    assert_eq!(got, want, "own, mid's, and far's through mid");
+
+    // `machine ls` names the way it was reached.
+    let machines = s.json(&["machine", "ls"])["machines"].as_array().cloned().unwrap_or_default();
+    let far_view = machines.iter().find(|m| m["name"] == "far").expect("far is in the mesh");
+    assert_eq!(far_view["through"], "mid", "{far_view}");
+
+    far.hc(&["server", "stop"]);
+}
+
+#[test]
+fn a_star_stops_at_the_machines_it_added() {
+    let (far, mid, mut s) = (Session::new(), Session::new(), Session::new());
+    s.env.push(fake_ssh(&s, &[("mid", &mid)]));
+    let (_, mid_ssh) = fake_ssh(&mid, &[("far", &far)]);
+    let via = mid.root.join("to-far");
+    std::fs::write(&via, format!("#!/bin/sh\nexec '{mid_ssh}' far \"$@\"\n")).unwrap();
+    std::fs::set_permissions(&via, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    s.env.push(("HC_RECONNECT_MS".into(), "200".into()));
+    s.json(&["machine", "add", "mid"]);
+    mid.json(&["machine", "add", "--via", &via.display().to_string(), "--name", "far"]);
+    let local = run(&s, &["sleep", "100"]);
+    let there = run(&mid, &["sleep", "100"]);
+    run(&far, &["sleep", "100"]);
+    wait_until("mid connected", || s.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
+
+    // mesh_depth is 0 (no config): the machines added here, and no further.
+    let mut got = addresses(&s.json(&["ls"]));
+    got.sort();
+    let mut want = vec![local, format!("mid/{there}")];
+    want.sort();
+    assert_eq!(got, want, "nothing past mid");
+    far.hc(&["server", "stop"]);
+}

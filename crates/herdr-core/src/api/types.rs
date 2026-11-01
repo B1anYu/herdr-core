@@ -327,6 +327,25 @@ pub struct ListParams {
     #[serde(default, with = "label_map")]
     #[schemars(with = "BTreeMap<String, String>")]
     pub labels: Vec<Label>,
+    /// `personal:` How many more hops to reach past this core (0: just here).
+    /// hc fills it in from `mesh_depth`; clients leave it out.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub depth: u32,
+    /// `personal:` The name each machine added here goes by on the core that
+    /// first asked, so a machine further out keeps the name it had there.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub names: BTreeMap<String, String>,
+    /// `personal:` The cores this list has already been asked of, by id: a
+    /// machine already there is the way back, and asking it would loop.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<String>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize, JsonSchema)]

@@ -34,6 +34,15 @@ pub struct Config {
     /// timeout on top), and to send anything at all before its line is
     /// given up and dialed again (default 30).
     pub machine_timeout: Option<f64>,
+    /// `personal:` How many machines deep `ls` and terminal routing reach:
+    /// a machine added here is 1, one only it added is 2. 0 (the default)
+    /// keeps the stock star: each core lists its own and its own machines'.
+    pub mesh_depth: Option<u32>,
+    /// `personal:` Machines that may operate on everything here, not just
+    /// terminals that started work there (names or core ids). Empty (the
+    /// default) keeps the stock rule.
+    #[serde(default)]
+    pub mesh_trust: Vec<String>,
 }
 
 fn seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
@@ -71,6 +80,17 @@ impl Config {
 
     pub fn history_bytes(&self) -> usize {
         (self.history_mb.unwrap_or(5.0).max(0.0) * 1024.0 * 1024.0) as usize
+    }
+
+    /// `personal:` See `mesh_depth`. Clamped: a deep mesh is a slow `ls`.
+    pub fn mesh_depth(&self) -> u32 {
+        self.mesh_depth.unwrap_or(0).min(8)
+    }
+
+    /// `personal:` Whether a machine, by any of the names it goes under here,
+    /// may operate on this core freely (see `mesh_trust`).
+    pub fn mesh_trusts(&self, names: &[&str]) -> bool {
+        self.mesh_trust.iter().any(|t| names.contains(&t.as_str()))
     }
 }
 
