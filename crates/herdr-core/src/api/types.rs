@@ -348,6 +348,19 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+/// `personal:` How far a `machine.list` looks past this core, and where it
+/// has already been. hc fills these in; clients leave them out.
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct MachineListParams {
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub depth: u32,
+    /// `personal:` The cores this list has already been asked of, by id.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<String>,
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct ListResult {
     /// This machine's terminals, then each connected machine's (`machine/t7`).

@@ -22,6 +22,7 @@ pub const FEATURES: &[&str] = &[
     "resize_notifications",
     "automatic_input",
     "restart_environment",
+    "mesh",
 ];
 pub const FINISHED_LINES: usize = 1000;
 /// Terminal identity variables replaced by the core's defaults unless explicitly overridden.
@@ -50,6 +51,9 @@ pub struct Call<'a> {
     pub conn: Option<&'a Arc<crate::wire::Conn>>,
     /// Where a plain connection receives its subscription.
     pub plain: Option<&'a std::sync::Mutex<Option<PlainSub>>>,
+    /// `personal:` The machine this call came from, when a trusted one is
+    /// using this core as a way into the mesh (not a local call).
+    pub machine: Option<&'a crate::machines::Machine>,
 }
 
 impl std::ops::Deref for Call<'_> {
@@ -142,7 +146,7 @@ methods! { Ctx<'_>;
     "machine.add" => machine_add, MachineAddParams => crate::machines::Machine,
         "Add another machine: dial it over ssh, check that hc answers there, and keep it under a name.",
         errors ["invalid_params", "name_taken", "already_added", "unreachable", "hc_missing", "incompatible"];
-    "machine.list" => machine_list, Empty => MachineListResult,
+    "machine.list" => machine_list, MachineListParams => MachineListResult,
         "The machines this core has added.",
         errors [];
     "machine.connect" => machine_connect, MachineParams => crate::remote::MachineView,
@@ -273,13 +277,12 @@ async fn terminal_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcEr
         (terminals, hidden, machines)
     };
     // `personal:` A local caller always sees the machines added here (the
-    // stock star). Asked from another machine, that stops here as it always
-    // did — two machines that added each other must not ask each other for
-    // good — unless this is a mesh call (`names` says where it started, and
-    // `seen` says where it has been).
+    // stock star), and a mesh also asks the cores that dialed in. Past
+    // `mesh_depth` hops nothing more is asked: `depth` is how far the call
+    // has already come.
     let mesh = crate::config::load(&core.paths.config).unwrap_or_default().mesh_depth();
-    let aggregating = !from_afar(core) || !p.names.is_empty();
-    let onward = p.depth + 1 < mesh && aggregating;
+    let afar = from_afar(core);
+    let onward = !afar || (mesh > 0 && p.depth < mesh);
     // From the core that asked: the core ids already reached on the way here,
     // and what each machine is called there. A machine further out keeps the
     // name it was first seen under.
@@ -288,32 +291,53 @@ async fn terminal_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcEr
         names.entry(m.name.clone()).or_insert_with(|| m.name.clone());
     }
     // The cores this list has been asked of so far, this one included. A
-    // machine already there is the way back, not a machine to add: asking it
-    // would ask this core again.
+    // machine already there is the way back, not a machine to ask again.
     let mut seen: std::collections::BTreeSet<String> = p.seen.iter().cloned().collect();
     seen.insert(core.info.id.clone());
-    // A machine already asked on the way here is the way back, not a machine
-    // to ask again.
-    let ask = machines.iter().filter(|m| aggregating && !seen.contains(&m.id));
-    // Each machine at once, each given a moment: a slow one never holds up the list.
+    if let Some((id, _)) = crate::remote::caller_peer(core.core, core.conn) {
+        seen.insert(id);
+    }
+    if let Some(m) = core.machine {
+        seen.insert(m.id.clone());
+    }
+    // Each connection at once, each given a moment: a slow one never holds up the list.
     let ask_params = {
         let mut params = serde_json::to_value(&p).unwrap_or_default();
-        if onward {
-            params["depth"] = (p.depth + 1).into();
-            params["names"] = serde_json::to_value(&names).unwrap_or_default();
-            params["seen"] = serde_json::to_value(&seen).unwrap_or_default();
-        }
+        params["depth"] = (p.depth + 1).into();
+        params["names"] = serde_json::to_value(&names).unwrap_or_default();
+        params["seen"] = serde_json::to_value(&seen).unwrap_or_default();
         params
     };
-    let asks: Vec<_> = ask
-        .map(|m| {
-            let (core, m, params) = (core.core.clone(), m.clone(), ask_params.clone());
-            tokio::spawn(async move {
-                let ask = crate::remote::forward(&core, &m, "terminal.list", params);
-                tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok)
+    let mut asks: Vec<_> = if onward {
+        machines
+            .iter()
+            .filter(|m| !seen.contains(&m.id))
+            .map(|m| {
+                let (core, m, params) = (core.core.clone(), m.clone(), ask_params.clone());
+                tokio::spawn(async move {
+                    let ask = crate::remote::forward(&core, &m, "terminal.list", params);
+                    tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok)
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // `personal:` A peer is a way to the machines it added (and they added).
+    if onward && mesh > 0 {
+        let peers = {
+            let st = core.lock();
+            crate::remote::connected_peers(&st)
+        };
+        for (id, name) in peers.into_iter().filter(|(id, _)| !seen.contains(id)) {
+            let (core, params) = (core.core.clone(), ask_params.clone());
+            let to = crate::remote::To::Peer { id, name };
+            asks.push(tokio::spawn(async move {
+                let ask = crate::remote::forward_to(&core, &to, "terminal.list", params);
+                tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok)
+            }));
+        }
+    }
     for ask in asks {
         if let Ok(Some(r)) = ask.await {
             terminals.extend(r["terminals"].as_array().cloned().unwrap_or_default());
@@ -586,7 +610,7 @@ async fn machine_exec(core: Ctx<'_>, p: ExecParams) -> Result<ExecResult, RpcErr
 }
 
 fn from_afar(core: Ctx<'_>) -> bool {
-    core.conn.is_some_and(|conn| crate::remote::is_peer(core, conn))
+    core.machine.is_some() || core.conn.is_some_and(|conn| crate::remote::is_peer(core, conn))
 }
 
 async fn file_read(core: Ctx<'_>, p: FileReadParams) -> Result<FileReadResult, RpcError> {
@@ -766,41 +790,76 @@ async fn machine_add(core: Ctx<'_>, p: MachineAddParams) -> Result<crate::machin
     Ok(machine)
 }
 
-async fn machine_list(core: Ctx<'_>, _: Empty) -> Result<MachineListResult, RpcError> {
+async fn machine_list(core: Ctx<'_>, p: MachineListParams) -> Result<MachineListResult, RpcError> {
     // `personal:` A mesh shows what is past this core too, marked with the
     // machine it was reached through. The stock star stops at what was added
     // here (mesh_depth 0).
     let mesh = crate::config::load(&core.paths.config).unwrap_or_default().mesh_depth();
+    let afar = from_afar(core);
     let (machines, here) = {
         let st = core.lock();
         let machines = st.machines.iter().map(|m| crate::remote::view(&st, m)).collect();
         (machines, core.info.id.clone())
     };
-    let mut out: Vec<crate::remote::MachineView> = machines;
-    if mesh > 0 {
-        let asked: Vec<_> = out
+    // A caller already at the mesh's edge hears of nothing further.
+    let mut out: Vec<crate::remote::MachineView> =
+        if afar && mesh > 0 && p.depth >= mesh { Vec::new() } else { machines };
+    if mesh > 0 && (!afar || p.depth < mesh) {
+        let mut seen: std::collections::BTreeSet<String> = p.seen.iter().cloned().collect();
+        seen.insert(here.clone());
+        if let Some((id, _)) = crate::remote::caller_peer(core.core, core.conn) {
+            seen.insert(id);
+        }
+        if let Some(m) = core.machine {
+            seen.insert(m.id.clone());
+        }
+        let params = json!({"depth": p.depth + 1, "seen": seen});
+        let direct: Vec<_> = out
             .iter()
             .filter(|v| v.state == "connected")
             .map(|v| v.machine.clone())
+            .filter(|m| !seen.contains(&m.id))
+            .collect();
+        let peers: Vec<_> = {
+            let st = core.lock();
+            crate::remote::connected_peers(&st)
+        };
+        let mut asked: Vec<_> = direct
+            .into_iter()
             .map(|m| {
-                let core = core.core.clone();
+                let (core, params) = (core.core.clone(), params.clone());
                 tokio::spawn(async move {
-                    let ask = crate::remote::forward(&core, &m, "machine.list", json!({}));
+                    let ask = crate::remote::forward(&core, &m, "machine.list", params);
                     let r = tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok);
-                    r.map(|r| (m, r))
+                    r.map(|r| (crate::remote::NextHop::Machine(m.id.clone()), m.name.clone(), r))
                 })
             })
             .collect();
+        for (id, name) in peers.into_iter().filter(|(id, _)| !seen.contains(id)) {
+            let (core, params) = (core.core.clone(), params.clone());
+            let to = crate::remote::To::Peer { id: id.clone(), name: name.clone() };
+            asked.push(tokio::spawn(async move {
+                let ask = crate::remote::forward_to(&core, &to, "machine.list", params);
+                let r = tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok);
+                r.map(|r| (crate::remote::NextHop::Peer(id.clone()), name, r))
+            }));
+        }
         let mut seen: std::collections::BTreeSet<String> = out.iter().map(|v| v.machine.id.clone()).collect();
         seen.insert(here);
         for ask in asked {
-            let Ok(Some((via, r))) = ask.await else { continue };
-            for v in r["machines"].as_array().cloned().unwrap_or_default() {
+            let Ok(Some((hop, hop_name, r))) = ask.await else { continue };
+            let views = r["machines"].as_array().cloned().unwrap_or_default();
+            {
+                // `personal:` Remember the way, so a call can take it too.
+                let mut st = core.lock();
+                crate::remote::learn_mesh(core.core, &mut st, hop, &views);
+            }
+            for v in views {
                 let Ok(mut view) = serde_json::from_value::<crate::remote::MachineView>(v) else { continue };
                 if !seen.insert(view.machine.id.clone()) {
                     continue;
                 }
-                view.through.get_or_insert_with(|| via.name.clone());
+                view.through.get_or_insert_with(|| hop_name.clone());
                 out.push(view);
             }
         }

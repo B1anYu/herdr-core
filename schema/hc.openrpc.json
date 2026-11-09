@@ -3852,7 +3852,29 @@
       "errors": [],
       "name": "machine.list",
       "paramStructure": "by-name",
-      "params": [],
+      "params": [
+        {
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "description": "`personal:` The cores this list has already been asked of, by id.",
+          "name": "seen",
+          "required": false,
+          "schema": {
+            "description": "`personal:` The cores this list has already been asked of, by id.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {

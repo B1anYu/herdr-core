@@ -592,16 +592,71 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
 /// What a machine may ask of terminals here that are parents of its own.
 const CALLS_BACK: &[&str] = &["terminal.send", "terminal.get", "terminal.read", "terminal.wait"];
 
+/// `personal:` Whether a route points back at the machine that made the call.
+fn goes_back(to: &To, m: &Machine) -> bool {
+    match to {
+        To::Machine(other) => other.id == m.id,
+        To::Peer { id, .. } => *id == m.id,
+        To::Mesh(via) => goes_back(via, m),
+    }
+}
+
 /// A call or a note from a machine we dialed. It reaches only terminals here
 /// that started work there: adding a machine gives it no say over the rest.
 async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Value) {
     let method = message["method"].as_str().unwrap_or_default();
     let mut params = message["params"].clone();
+    // `personal:` A machine this core trusts may use it as a way to the rest
+    // of the mesh, not only to terminals that started work there.
+    let cfg = crate::config::load(&core.paths.config).unwrap_or_default();
+    let trusted = cfg.mesh_depth() > 0 && cfg.mesh_trusts(&[m.id.as_str(), m.name.as_str()]);
+    // `personal:` Seeing the mesh is not acting in it: a machine added here
+    // may always ask what is around, even when it may not touch anything.
+    let lists = method == "terminal.list" || method == "machine.list";
+    if method != "notes" && (trusted || lists) {
+        let routed = crate::remote::route(&core, None, method, &params).await;
+        match routed {
+            Ok(Some((to, params))) => {
+                let result = if goes_back(&to, &m) {
+                    Err(RpcError::new("denied", "that address points back to its caller", ""))
+                } else {
+                    crate::remote::forward_to(&core, &to, method, params).await
+                };
+                if let Some(id) = message.get("id") {
+                    line.message(&crate::rpc::response(id.clone(), result));
+                }
+                return;
+            }
+            // A trusted machine's call is a call like a peer's, not only a
+            // callback into terminals that started work there.
+            Ok(None) => {
+                let mut params = params.clone();
+                if let Some(caller) = params["caller"].as_str() {
+                    let own = format!("{}/", m.id);
+                    let own_name = format!("{}/", m.name);
+                    let rest = caller.strip_prefix(&own).or_else(|| caller.strip_prefix(&own_name)).unwrap_or(caller);
+                    params["caller"] = format!("{}/{rest}", m.name).into();
+                }
+                let call = crate::api::Call { core: &core, conn: None, plain: None, machine: Some(&m) };
+                let result = crate::api::dispatch(&call, method, params).await;
+                if let Some(id) = message.get("id") {
+                    line.message(&crate::rpc::response(id.clone(), result));
+                }
+                return;
+            }
+            Err(e) => {
+                if let Some(id) = message.get("id") {
+                    line.message(&crate::rpc::response(id.clone(), Err(e)));
+                }
+                return;
+            }
+        }
+    }
     let key = if method == "notes" { "parent" } else { "terminal" };
     let parent = params[key].as_str().and_then(|t| {
         let st = core.lock();
         let id = st.reg.resolve(crate::addr::local(t, &core.info.id, &core.info.name).ok()?).ok()?;
-        st.reg.terminals.get(&id).filter(|t| t.afar.contains(&m.id)).map(|_| id)
+        st.reg.terminals.get(&id).filter(|t| trusted || t.afar.contains(&m.id)).map(|_| id)
     });
     if method == "notes" {
         if let (Some(id), Some(text)) = (parent, params["text"].as_str()) {
@@ -610,7 +665,7 @@ async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Val
         }
         return;
     }
-    let result = match parent.filter(|_| CALLS_BACK.contains(&method)) {
+    let result = match parent.filter(|_| trusted || CALLS_BACK.contains(&method)) {
         None => Err(RpcError::new(
             "denied",
             format!("{} may only reach the terminals here that started its own", m.name),
@@ -621,7 +676,7 @@ async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Val
             if let Some(caller) = params["caller"].as_str() {
                 params["caller"] = format!("{}/{caller}", m.name).into();
             }
-            let call = crate::api::Call { core: &core, conn: None, plain: None };
+            let call = crate::api::Call { core: &core, conn: None, plain: None, machine: None };
             crate::api::dispatch(&call, method, params).await
         }
     };
@@ -815,9 +870,103 @@ pub enum To {
     Machine(Machine),
     /// A core that dialed in: only to the parents of its terminals here.
     Peer { id: String, name: String },
+    /// `personal:` Somewhere past this core. The address keeps its prefix:
+    /// the next hop is the one that knows that machine by that name.
+    Mesh(Box<To>),
 }
 
-/// What an address prefix names: this core (`None`), a machine, or a peer.
+impl To {
+    /// The peer at the end of this route, if any.
+    fn peer_id(&self) -> Option<&str> {
+        match self {
+            To::Peer { id, .. } => Some(id),
+            To::Mesh(inner) => inner.peer_id(),
+            To::Machine(_) => None,
+        }
+    }
+
+    /// The machine at the end of this route, if any.
+    fn machine_id(&self) -> Option<&str> {
+        match self {
+            To::Machine(m) => Some(&m.id),
+            To::Mesh(inner) => inner.machine_id(),
+            To::Peer { .. } => None,
+        }
+    }
+}
+
+/// `personal:` The neighbor a mesh entry is reached through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NextHop {
+    /// A machine added here, by its core id.
+    Machine(String),
+    /// A core that dialed in, by its core id.
+    Peer(String),
+}
+
+/// `personal:` A machine past this core that a mesh learned about: its core
+/// id, the name the next hop calls it, and that hop.
+#[derive(Clone, Debug)]
+pub struct MeshEntry {
+    pub id: String,
+    pub name: String,
+    pub next: NextHop,
+}
+
+/// `personal:` Record what a neighbor said about the machines past it. The
+/// name stored is the one that neighbor uses, so a prefix made here means the
+/// same machine there.
+pub fn learn_mesh(core: &Core, st: &mut State, hop: NextHop, views: &[Value]) {
+    for v in views {
+        let (Some(id), Some(name)) = (v["id"].as_str(), v["name"].as_str()) else { continue };
+        if id == core.info.id {
+            continue; // the way back here is not another machine
+        }
+        let entry = MeshEntry { id: id.to_owned(), name: name.to_owned(), next: hop.clone() };
+        match st.mesh.iter_mut().find(|e| e.id == id) {
+            Some(old) => *old = entry,
+            None => st.mesh.push(entry),
+        }
+    }
+}
+
+/// `personal:` The cores that dialed in and are connected now, with the name
+/// each goes by here.
+pub fn connected_peers(st: &State) -> Vec<(String, String)> {
+    st.peer_lines.keys().filter_map(|id| st.peers.get(id).map(|p| (id.clone(), p.name.clone()))).collect()
+}
+
+/// `personal:` The peer on `conn`, if it is one.
+fn peer_on(core: &Core, conn: &Arc<Conn>) -> Option<(String, String)> {
+    let st = core.lock();
+    peer_on_in(&st, conn)
+}
+
+/// `personal:` As `peer_on`, for callers already holding the state lock.
+fn peer_on_in(st: &State, conn: &Arc<Conn>) -> Option<(String, String)> {
+    let key = conn_key(conn);
+    let id = st.peer_lines.iter().find(|(_, (k, _))| *k == key).map(|(id, _)| id.clone())?;
+    let name = st.peers.get(&id)?.name.clone();
+    Some((id, name))
+}
+
+/// `personal:` The caller on `conn`, when it is a core that dialed in.
+pub fn caller_peer(core: &Core, conn: Option<&Arc<Conn>>) -> Option<(String, String)> {
+    conn.and_then(|c| peer_on(core, c))
+}
+
+/// `personal:` Whether a caller may reach past this core (`mesh_trust`).
+/// Local callers always can; a core that dialed in only when trusted.
+fn caller_trusted(core: &Core, st: &State, conn: Option<&Arc<Conn>>) -> bool {
+    let Some(conn) = conn else { return true };
+    // A framed connection that is not a core that dialed in is a local
+    // client (a viewer, the CLI): it may use this core's machines as always.
+    let Some((id, name)) = peer_on_in(st, conn) else { return true };
+    crate::config::load(&core.paths.config).unwrap_or_default().mesh_trusts(&[id.as_str(), name.as_str()])
+}
+
+/// What an address prefix names: this core (`None`), a machine, a peer, or a
+/// machine a mesh reaches through one of them.
 fn named(core: &Core, st: &State, prefix: &str) -> Result<Option<To>, RpcError> {
     if prefix == core.info.id || prefix == core.info.name {
         return Ok(None);
@@ -825,15 +974,106 @@ fn named(core: &Core, st: &State, prefix: &str) -> Result<Option<To>, RpcError> 
     if let Some(m) = st.machines.iter().find(|m| m.name == prefix || m.id == prefix) {
         return Ok(Some(To::Machine(m.clone())));
     }
-    match st.peers.iter().find(|(id, p)| *id == prefix || p.name == prefix) {
-        Some((id, p)) => Ok(Some(To::Peer { id: id.clone(), name: p.name.clone() })),
-        None => Err(crate::machines::unknown(&st.machines, prefix)),
+    if let Some((id, p)) = st.peers.iter().find(|(id, p)| *id == prefix || p.name == prefix) {
+        return Ok(Some(To::Peer { id: id.clone(), name: p.name.clone() }));
+    }
+    // `personal:` A machine past this core, reached through the neighbor that
+    // first showed it to us, under that neighbor's name for it.
+    let found: Vec<&MeshEntry> = st.mesh.iter().filter(|e| e.id == prefix || e.name == prefix).collect();
+    match found.as_slice() {
+        [] => Err(crate::machines::unknown(&st.machines, prefix)),
+        [entry] => match &entry.next {
+            NextHop::Machine(id) => match st.machines.iter().find(|m| &m.id == id) {
+                Some(m) => Ok(Some(To::Mesh(Box::new(To::Machine(m.clone()))))),
+                None => Err(crate::machines::unknown(&st.machines, prefix)),
+            },
+            NextHop::Peer(id) => match st.peers.get(id) {
+                Some(p) => {
+                    let peer = To::Peer { id: id.clone(), name: p.name.clone() };
+                    Ok(Some(To::Mesh(Box::new(peer))))
+                }
+                None => Err(crate::machines::unknown(&st.machines, prefix)),
+            },
+        },
+        _ => Err(RpcError::new(
+            "machine_unknown",
+            format!("{prefix:?} names more than one machine in the mesh"),
+            "use the core id `hc machine ls` shows for it",
+        )),
+    }
+}
+
+/// `personal:` Ask the neighbors what machines they know, and remember it.
+/// A mesh address nobody here knows may simply not have been shown to us yet.
+async fn discover(core: &Arc<Core>) {
+    let (machines, peers) = {
+        let st = core.lock();
+        let connected: Vec<Machine> = st
+            .machines
+            .iter()
+            .filter(|m| matches!(st.lines.get(&m.id), Some(LineState::Connected(_))))
+            .cloned()
+            .collect();
+        (connected, connected_peers(&st))
+    };
+    // One hop out: what they added, and what those machines added.
+    let params = json!({"depth": 1, "seen": [core.info.id]});
+    let mut asks = Vec::new();
+    for m in machines {
+        let (core, params) = (core.clone(), params.clone());
+        asks.push(tokio::spawn(async move {
+            let ask = forward(&core, &m, "machine.list", params);
+            let r = tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok);
+            r.map(|r| (NextHop::Machine(m.id.clone()), r))
+        }));
+    }
+    for (id, name) in peers {
+        let (core, params) = (core.clone(), params.clone());
+        let to = To::Peer { id: id.clone(), name };
+        asks.push(tokio::spawn(async move {
+            let ask = forward_to(&core, &to, "machine.list", params);
+            let r = tokio::time::timeout(Duration::from_secs(3), ask).await.ok().and_then(Result::ok);
+            r.map(|r| (NextHop::Peer(id.clone()), r))
+        }));
+    }
+    for ask in asks {
+        let Ok(Some((hop, r))) = ask.await else { continue };
+        let views = r["machines"].as_array().cloned().unwrap_or_default();
+        let mut st = core.lock();
+        learn_mesh(core, &mut st, hop, &views);
     }
 }
 
 /// Where a call goes: here (`None`), or elsewhere with the params to send,
 /// addresses as they are seen there.
-pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Value)>, RpcError> {
+pub async fn route(
+    core: &Arc<Core>,
+    conn: Option<&Arc<Conn>>,
+    method: &str,
+    params: &Value,
+) -> Result<Option<(To, Value)>, RpcError> {
+    match route_here(core, conn, method, params) {
+        // `personal:` A mesh address nobody here knows may not have been
+        // shown to us yet: ask the neighbors once, then look again.
+        Err(e)
+            if e.kind == "machine_unknown"
+                && crate::config::load(&core.paths.config).unwrap_or_default().mesh_depth() > 0 =>
+        {
+            discover(core).await;
+            route_here(core, conn, method, params)
+        }
+        other => other,
+    }
+}
+
+fn route_here(
+    core: &Core,
+    conn: Option<&Arc<Conn>>,
+    method: &str,
+    params: &Value,
+) -> Result<Option<(To, Value)>, RpcError> {
+    let cfg = crate::config::load(&core.paths.config).unwrap_or_default();
+    let mesh = cfg.mesh_depth();
     let st = core.lock();
     let mut params = params.clone();
     let to = if matches!(
@@ -841,11 +1081,17 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
         "terminal.run" | "machine.exec" | "file.read" | "file.write" | "file.edit" | "doc.get" | "doc.set"
     ) {
         let Some(on) = params["on"].as_str().map(String::from) else { return Ok(None) };
-        params.as_object_mut().map(|p| p.remove("on"));
-        match named(core, &st, &on)? {
-            Some(To::Peer { name, .. }) => return Err(crate::machines::unknown(&st.machines, &name)),
-            to => to,
+        let to = named(core, &st, &on)?;
+        // `personal:` In a mesh a peer is a way to another machine; the stock
+        // star still refuses to start work on a core that dialed in.
+        if matches!(to, Some(To::Peer { .. })) && mesh == 0 {
+            return Err(crate::machines::unknown(&st.machines, &on));
         }
+        // A mesh hop resolves `on` itself: keep it for it.
+        if !matches!(to, Some(To::Mesh(_))) {
+            params.as_object_mut().map(|p| p.remove("on"));
+        }
+        to
     } else if ON_A_TERMINAL.contains(&method) && params["children"].is_null() {
         let Some((prefix, local)) =
             params["terminal"].as_str().and_then(|t| t.split_once('/')).map(|(a, b)| (a.to_string(), b.to_string()))
@@ -853,20 +1099,44 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             return Ok(None);
         };
         let to = named(core, &st, &prefix)?;
-        if let Some(To::Peer { name, .. }) = &to
-            && !CALLS_BACK.contains(&method)
-        {
-            return Err(RpcError::new("denied", format!("{name} only takes send, read, get and wait from here"), ""));
+        // A mesh hop knows that prefix; a direct machine or peer sees bare.
+        if !matches!(to, Some(To::Mesh(_))) {
+            params["terminal"] = local.into();
         }
-        params["terminal"] = local.into();
         to
     } else {
         None
     };
     let Some(to) = to else { return Ok(None) };
+    // The stock star lets a core that dialed in take only callbacks; a mesh
+    // opens the rest, because such a peer is then a way to other machines.
+    if mesh == 0
+        && let To::Peer { name, .. } = &to
+        && !CALLS_BACK.contains(&method)
+    {
+        return Err(RpcError::new("denied", format!("{name} only takes send, read, get and wait from here"), ""));
+    }
+    // `personal:` Reaching past this core is a mesh move: a local caller may,
+    // a core that dialed in needs `mesh_trust` here.
+    if !caller_trusted(core, &st, conn) {
+        return Err(RpcError::new(
+            "denied",
+            "this core is not trusted to reach other machines through this one",
+            "its owner can add you to mesh_trust",
+        ));
+    }
+    // Never send a peer's call straight back to that peer: it already has it.
+    if let Some(conn) = conn
+        && let Some(id) = to.peer_id()
+        && peer_on_in(&st, conn).is_some_and(|(caller, _)| caller == id)
+    {
+        return Err(RpcError::new("denied", "that address points back to its caller", ""));
+    }
     // Our callers travel by our id (the machine names them; see `from_peer`);
     // a peer names callers from here itself.
-    if let (To::Machine(_), Some(caller)) = (&to, params["caller"].as_str()) {
+    if to.machine_id().is_some()
+        && let Some(caller) = params["caller"].as_str()
+    {
         params["caller"] = format!("{}/{caller}", core.info.id).into();
     }
     Ok(Some((to, params)))
@@ -1061,27 +1331,48 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
 pub async fn forward_to(core: &Core, to: &To, method: &str, params: Value) -> Result<Value, RpcError> {
     match to {
         To::Machine(m) => forward(core, m, method, params).await,
-        To::Peer { id, name } => {
-            let found = core.lock().peer_lines.get(id).map(|(_, l)| l.clone());
-            let line = found
-                .ok_or_else(|| RpcError::new("unavailable", format!("{name} is not connected"), "try again later"))?;
-            let calls_me = core.lock().peers.get(id).map(|p| p.calls_me.clone()).unwrap_or_default();
-            // Reverse calls have no incoming heartbeat monitor: leave room for
-            // a walked-away draft, but still bound a stuck peer. Its config may
-            // differ: never shorten the default allowance using our local cap.
-            let draft = if method == "terminal.send" {
-                crate::input::draft_timeout(&core.paths.config)
-                    .max(crate::input::default_draft_timeout())
-                    .max(crate::input::quiet())
-                    + crate::server::heartbeat_every().min(Duration::from_secs(5))
-            } else {
-                Duration::ZERO
-            };
-            let deadline = deadline_for(core, method, &params) + draft;
-            let reply = line.call(name, method, params, deadline).await?;
-            Ok(if method.starts_with("doc.") { reply } else { localize(core, name, &[calls_me.as_str()], reply) })
-        }
+        To::Peer { id, name } => peer_call(core, id, name, method, params, true).await,
+        // `personal:` A mesh hop names everything past it already: its reply
+        // speaks the names the caller knows, so nothing is added here.
+        To::Mesh(via) => match via.as_ref() {
+            To::Peer { id, name } => peer_call(core, id, name, method, params, false).await,
+            To::Machine(m) => forward(core, m, method, params).await,
+            To::Mesh(_) => unreachable!("a mesh hop always ends at one neighbor"),
+        },
     }
+}
+
+async fn peer_call(
+    core: &Core,
+    id: &str,
+    name: &str,
+    method: &str,
+    params: Value,
+    localize_reply: bool,
+) -> Result<Value, RpcError> {
+    let found = core.lock().peer_lines.get(id).map(|(_, l)| l.clone());
+    let line =
+        found.ok_or_else(|| RpcError::new("unavailable", format!("{name} is not connected"), "try again later"))?;
+    let calls_me = core.lock().peers.get(id).map(|p| p.calls_me.clone()).unwrap_or_default();
+    // Reverse calls have no incoming heartbeat monitor: leave room for a
+    // walked-away draft, but still bound a stuck peer. Its config may differ:
+    // never shorten the default allowance using our local cap.
+    let draft = if method == "terminal.send" {
+        crate::input::draft_timeout(&core.paths.config)
+            .max(crate::input::default_draft_timeout())
+            .max(crate::input::quiet())
+            + crate::server::heartbeat_every().min(Duration::from_secs(5))
+    } else {
+        Duration::ZERO
+    };
+    let deadline = deadline_for(core, method, &params) + draft;
+    let reply = line.call(name, method, params, deadline).await?;
+    // A machine's name is its own: machine.list is not an address.
+    Ok(if !localize_reply || method.starts_with("doc.") || method == "machine.list" {
+        reply
+    } else {
+        localize(core, name, &[calls_me.as_str()], reply)
+    })
 }
 
 /// Addresses from the core called `name`: its `t7` is `name/t7` here; ours

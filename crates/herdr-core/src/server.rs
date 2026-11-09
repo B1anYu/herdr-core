@@ -489,9 +489,9 @@ async fn handle(
         let err = RpcError::invalid_request("missing method");
         return reply(rpc::response(request["id"].clone(), Err(err)));
     };
-    let call = api::Call { core, conn, plain };
+    let call = api::Call { core, conn, plain, machine: None };
     let params = crate::remote::from_peer(core, conn, request["params"].clone());
-    let result = match crate::remote::route(core, method, &params) {
+    let result = match crate::remote::route(core, conn, method, &params).await {
         _ if method == "$/orphaned" => crate::remote::orphaned(core, conn, &params).await,
         Ok(Some((crate::remote::To::Machine(machine), params))) if method == "terminal.attach" => match conn {
             Some(conn) => crate::remote::attach(core, conn, &machine, params).await,

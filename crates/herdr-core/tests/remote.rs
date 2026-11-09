@@ -759,6 +759,7 @@ fn mesh_env(here: &mut Session, lines: u32) {
 fn a_mesh_lists_a_machine_it_only_reaches_through_another() {
     let (far, mut mid, mut s) = (Session::new(), Session::new(), Session::new());
     // s adds mid; mid adds far. s has no way to far at all.
+    named_core(&mut s, "s");
     s.env.push(fake_ssh(&s, &[("mid", &mid)]));
     let (_, mid_ssh) = fake_ssh(&mid, &[("far", &far)]);
     // `mid` runs under s's ssh script, so it names its own way to far: a
@@ -767,7 +768,7 @@ fn a_mesh_lists_a_machine_it_only_reaches_through_another() {
     std::fs::write(&via, format!("#!/bin/sh\nexec '{mid_ssh}' far \"$@\"\n")).unwrap();
     std::fs::set_permissions(&via, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     mesh_env(&mut s, 2);
-    mesh_env(&mut mid, 2);
+    mesh_cfg(&mut mid, 2, &["s"]);
     s.json(&["machine", "add", "mid"]);
     mid.json(&["machine", "add", "--via", &via.display().to_string(), "--name", "far"]);
     let local = run(&s, &["sleep", "100"]);
@@ -783,7 +784,7 @@ fn a_mesh_lists_a_machine_it_only_reaches_through_another() {
     });
     let mut got = addresses(&s.json(&["ls"]));
     got.sort();
-    let mut want = vec![local, format!("mid/{there}"), far_terminal];
+    let mut want = vec![local, format!("mid/{there}"), far_terminal.clone()];
     want.sort();
     assert_eq!(got, want, "own, mid's, and far's through mid");
 
@@ -791,6 +792,9 @@ fn a_mesh_lists_a_machine_it_only_reaches_through_another() {
     let machines = s.json(&["machine", "ls"])["machines"].as_array().cloned().unwrap_or_default();
     let far_view = machines.iter().find(|m| m["name"] == "far").expect("far is in the mesh");
     assert_eq!(far_view["through"], "mid", "{far_view}");
+
+    // `personal:` The way it was reached is a way to act too.
+    assert_eq!(text(&s, &far_terminal), "", "read through mid");
 
     far.hc(&["server", "stop"]);
 }
@@ -818,4 +822,82 @@ fn a_star_stops_at_the_machines_it_added() {
     want.sort();
     assert_eq!(got, want, "nothing past mid");
     far.hc(&["server", "stop"]);
+}
+
+/// `personal:` A session's core gets a name of its own, as real machines do.
+fn named_core(s: &Session, name: &str) {
+    let dir = s.root.join("state/herdr-core/test");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("core.json"), format!(r#"{{"id":"core-{name}","name":"{name}"}}"#)).unwrap();
+}
+
+/// `personal:` mesh_depth, and which cores may reach past this one.
+fn mesh_cfg(s: &mut Session, depth: u32, trust: &[&str]) {
+    let path = s.root.join("config/herdr-core/config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let trust = trust.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(", ");
+    std::fs::write(path, format!("mesh_depth = {depth}\nmesh_trust = [{trust}]\n")).unwrap();
+}
+
+#[test]
+fn a_core_sees_and_reaches_the_mesh_of_the_core_that_dialed_in() {
+    let (mut far, mut hub, mut wsl) = (Session::new(), Session::new(), Session::new());
+    named_core(&hub, "hub");
+    named_core(&far, "sg");
+    named_core(&wsl, "wsl");
+    // Only hub dials: wsl added nothing, so the mesh must come to it.
+    hub.env.push(fake_ssh(&hub, &[("wsl", &wsl), ("sg", &far)]));
+    mesh_cfg(&mut hub, 2, &["wsl"]);
+    mesh_cfg(&mut wsl, 2, &["hub"]);
+    mesh_cfg(&mut far, 2, &["hub"]);
+    hub.json(&["machine", "add", "wsl"]);
+    hub.json(&["machine", "add", "sg"]);
+    let in_hub = run(&hub, &["sleep", "100"]);
+    let in_sg = run(&far, &["sh", "-c", "while read l; do echo got-$l; done"]);
+    wait_until("hub's machines connected", || {
+        hub.json(&["machine", "ls"])["machines"].as_array().unwrap().iter().all(|m| m["state"] == "connected")
+    });
+    let at_sg = format!("sg/{in_sg}");
+    wait_until("the mesh at wsl", || {
+        let mut got = addresses(&wsl.json(&["ls"]));
+        got.sort();
+        let mut want = vec![format!("hub/{in_hub}"), at_sg.clone()];
+        want.sort();
+        got == want
+    });
+
+    // Control: the same way the list came, as a mesh address.
+    wsl.json(&["send", &at_sg, "hi"]);
+    wait_until("output through hub", || text(&wsl, &at_sg).contains("got-hi"));
+    let started = wsl.json(&["run", "--bg", "--on", "sg", "sleep", "100"]);
+    assert!(started["address"].as_str().unwrap().starts_with("sg/"), "{started}");
+
+    for s in [&wsl, &hub, &far] {
+        s.hc(&["server", "stop"]);
+    }
+}
+
+#[test]
+fn a_peer_not_in_mesh_trust_can_list_but_not_reach_other_machines() {
+    let (far, mut hub, mut wsl) = (Session::new(), Session::new(), Session::new());
+    named_core(&hub, "hub");
+    named_core(&far, "sg");
+    named_core(&wsl, "wsl");
+    hub.env.push(fake_ssh(&hub, &[("wsl", &wsl), ("sg", &far)]));
+    mesh_cfg(&mut hub, 2, &[]); // wsl may see through hub, not act through it
+    mesh_cfg(&mut wsl, 2, &["hub"]);
+    hub.json(&["machine", "add", "wsl"]);
+    hub.json(&["machine", "add", "sg"]);
+    let in_sg = run(&far, &["sleep", "100"]);
+    wait_until("hub's machines connected", || {
+        hub.json(&["machine", "ls"])["machines"].as_array().unwrap().iter().all(|m| m["state"] == "connected")
+    });
+    let at_sg = format!("sg/{in_sg}");
+    wait_until("the mesh at wsl", || addresses(&wsl.json(&["ls"])).contains(&at_sg));
+    let (_, err) = wsl.err(&["--json", "read", &at_sg]);
+    assert_eq!(err["error"]["kind"], "denied", "{err}");
+
+    for s in [&wsl, &hub, &far] {
+        s.hc(&["server", "stop"]);
+    }
 }

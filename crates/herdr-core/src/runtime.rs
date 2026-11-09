@@ -84,6 +84,9 @@ pub struct State {
     pub killing: HashSet<u32>,
     pub stopping: bool,
     pub machines: Vec<crate::machines::Machine>,
+    /// `personal:` Machines learned through the mesh, with the way there.
+    /// Rebuilt from `machine.list` replies (and discovery), not kept on disk.
+    pub mesh: Vec<crate::remote::MeshEntry>,
     /// The line to each machine, by its core id, and the task keeping it up.
     pub lines: HashMap<String, crate::remote::LineState>,
     pub line_tasks: HashMap<String, tokio::task::AbortHandle>,
