@@ -17,6 +17,11 @@ pub struct Terminal {
     pub name: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub argv: Vec<String>,
+    /// `personal:` What keep starts when this terminal's program is lost, in
+    /// place of the shell (an agent's resume command). None: this machine's
+    /// shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<Vec<String>>,
     pub cwd: String,
     /// Replace a lost program with this machine’s shell, in place. Exit with a code and kill remain final.
     #[serde(default)]
@@ -229,6 +234,8 @@ pub struct NewTerminal {
     pub name: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub argv: Vec<String>,
+    /// `personal:` Started instead of the shell when keep recovers it.
+    pub restore: Option<Vec<String>>,
     pub cwd: String,
     pub cols: u16,
     pub rows: u16,
@@ -265,6 +272,7 @@ impl Registry {
                 name: new.name,
                 labels: new.labels.into_iter().filter(|(_, v)| !v.is_empty()).collect(),
                 argv: new.argv,
+                restore: new.restore,
                 cwd: new.cwd,
                 keep: new.keep,
                 last_cwd: None,

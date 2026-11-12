@@ -37,6 +37,9 @@ impl Core {
             let reason = t.reason.clone().filter(|r| r != "spawn_pending").unwrap_or_else(|| "holder_lost".into());
             self.record_finish(st, id, proto::Exit { code: None, signal: None }, &reason);
         } else {
+            // `personal:` A restore command that cannot start must not retry
+            // forever: come back as the shell next time.
+            t.restore = None;
             t.schedule_restart(now_ms());
         }
         self.save(st);
@@ -97,7 +100,9 @@ impl Core {
             let (env, scope) = crate::api::terminal_env(&self, id, &cwd, env);
             t.scope = Some(scope);
             t.holder = Some(instance);
-            t.argv = shell.clone();
+            // `personal:` A caller may name what comes back (an agent's
+            // resume command); otherwise it is this machine's shell.
+            t.argv = t.restore.clone().unwrap_or_else(|| shell.clone());
             t.cwd = cwd.clone();
             t.template = None;
             t.reported = false;

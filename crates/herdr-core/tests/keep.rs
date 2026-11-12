@@ -66,6 +66,30 @@ fn lost_kept_terminal_restarts_in_place_in_its_last_folder() {
 }
 
 #[test]
+fn a_kept_terminal_restarts_its_restore_command() {
+    let s = Session::new();
+    s.json(&["server", "start"]);
+    let mut conn = s.connect();
+    let started = conn.call(
+        1,
+        "terminal.run",
+        serde_json::json!({
+            "argv": ["sleep", "100"], "keep": true,
+            "restore": ["sh", "-c", "echo restore-ran; exec sleep 100"]
+        }),
+    );
+    let t = started["result"]["address"].as_str().unwrap().to_string();
+    let old = get(&s, &t)["pid"].as_i64().unwrap();
+    let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap();
+    unsafe {
+        libc::kill(holder as i32, libc::SIGKILL);
+    }
+    wait_until("its restore command", || text(&s, &t).contains("restore-ran"));
+    assert_ne!(get(&s, &t)["pid"].as_i64().unwrap(), old);
+    assert_eq!(get(&s, &t)["argv"], serde_json::json!(["sh", "-c", "echo restore-ran; exec sleep 100"]));
+}
+
+#[test]
 fn kept_terminal_survives_core_crash_and_recovers_if_its_holder_is_also_lost() {
     let s = Session::new();
     let t = run(&s, &["--keep", "sleep", "100"]);

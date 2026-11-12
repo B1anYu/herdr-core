@@ -229,6 +229,11 @@ pub struct RunParams {
     #[arg(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<String>,
+    /// `personal:` What keep starts instead of the shell if this program is
+    /// lost (an agent's resume command). Omitted: this machine's shell.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<Vec<String>>,
     /// Initial size before the program starts. Omitted: the configured
     /// headless size (default 200 columns by 120 rows). Later viewers resize normally.
     #[arg(skip)]

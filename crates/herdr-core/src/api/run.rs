@@ -154,6 +154,7 @@ pub(super) async fn start(
             name: p.name,
             labels: labels(&p.labels),
             argv: p.argv.clone(),
+            restore: p.restore.clone(),
             cwd: cwd.clone(),
             cols,
             rows,

@@ -892,6 +892,16 @@
             "description": "Whether the program ever sent a 7501 report.",
             "type": "boolean"
           },
+          "restore": {
+            "description": "`personal:` What keep starts when this terminal's program is lost, in\nplace of the shell (an agent's resume command). None: this machine's\nshell.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "rm": {
             "default": false,
             "description": "Removed right after it exits (once a waiting parent has the exit code).",
@@ -1372,6 +1382,16 @@
             "default": false,
             "description": "Whether the program ever sent a 7501 report.",
             "type": "boolean"
+          },
+          "restore": {
+            "description": "`personal:` What keep starts when this terminal's program is lost, in\nplace of the shell (an agent's resume command). None: this machine's\nshell.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "rm": {
             "default": false,
@@ -1927,6 +1947,21 @@
             "description": "Parent terminal (default: the terminal it is started from).",
             "type": [
               "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "`personal:` What keep starts instead of the shell if this program is\nlost (an agent's resume command). Omitted: this machine's shell.",
+          "name": "restore",
+          "required": false,
+          "schema": {
+            "description": "`personal:` What keep starts instead of the shell if this program is\nlost (an agent's resume command). Omitted: this machine's shell.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
               "null"
             ]
           }
