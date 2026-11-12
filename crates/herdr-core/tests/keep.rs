@@ -90,6 +90,30 @@ fn a_kept_terminal_restarts_its_restore_command() {
 }
 
 #[test]
+fn a_claude_run_through_hc_comes_back_to_its_conversation() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut s = Session::new();
+    let bin = s.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(&claude, "#!/bin/sh\necho fake-claude \"$@\"\nexec sleep 100\n").unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    s.env.push(("PATH".into(), format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())));
+    let t = run(&s, &["--keep", "claude", "do it"]);
+    let r = get(&s, &t);
+    let argv: Vec<&str> = r["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(argv[..2], ["claude", "--session-id"], "{r}");
+    let id = argv[2].to_string();
+    assert_eq!(r["restore"], serde_json::json!(["claude", "--resume", id]));
+    wait_until("it started", || text(&s, &t).contains("fake-claude"));
+    let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap();
+    unsafe {
+        libc::kill(holder as i32, libc::SIGKILL);
+    }
+    wait_until("the conversation comes back", || text(&s, &t).contains(&format!("fake-claude --resume {id}")));
+}
+
+#[test]
 fn kept_terminal_survives_core_crash_and_recovers_if_its_holder_is_also_lost() {
     let s = Session::new();
     let t = run(&s, &["--keep", "sleep", "100"]);

@@ -18,6 +18,12 @@ pub(super) async fn terminal_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunR
         (None, None, false) => {}
         _ => return Err(RpcError::invalid_params("give argv or line, not both")),
     }
+    // `personal:` A caller that does not say how to come back (hc run claude,
+    // another agent starting one) still gets its conversation id here, so
+    // keep can resume it after a reboot.
+    if p.restore.is_none() {
+        p.restore = resume_agent(&mut p.argv);
+    }
     let quiet_ready = template.as_ref().is_some_and(|t| t.ready_when_quiet);
     let caller = p.caller.clone();
     let timeout = if p.wait { Some(wait_timeout(core, p.timeout)?) } else { None }; // checked before it starts
@@ -251,8 +257,70 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
     env
 }
 
+/// `personal:` Give Claude Code a conversation id at start, and return the
+/// command that resumes it. Anything already choosing a conversation (or not
+/// Claude at all) is left alone.
+fn resume_agent(argv: &mut Vec<String>) -> Option<Vec<String>> {
+    let exe = argv.first()?.clone();
+    let name = std::path::Path::new(&exe).file_name()?.to_str()?;
+    if name.strip_suffix(".exe").unwrap_or(name) != "claude" {
+        return None;
+    }
+    const CONTINUES: &[&str] = &["--session-id", "--resume", "--continue", "-c", "--from-pr", "--fork-session"];
+    if argv.iter().any(|a| CONTINUES.contains(&a.as_str())) {
+        return None;
+    }
+    let id = uuid();
+    argv.splice(1..1, ["--session-id".to_owned(), id.clone()]);
+    Some(vec![exe, "--resume".to_owned(), id])
+}
+
+/// `personal:` A version-4 UUID from the standard library alone.
+fn uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+    let mut a = std::collections::hash_map::RandomState::new().build_hasher();
+    a.write_u128(now);
+    a.write_u32(std::process::id());
+    let x = a.finish();
+    let mut b = std::collections::hash_map::RandomState::new().build_hasher();
+    b.write_u64(x);
+    b.write_u128(now.rotate_left(17));
+    let y = b.finish();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (x >> 32) as u32,
+        ((x >> 16) & 0xffff) as u16,
+        (x & 0x0fff) as u16,
+        (((y >> 48) & 0x3fff) | 0x8000) as u16,
+        y & 0x0000_ffff_ffff_ffff
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_claude_without_a_session_gets_one_and_a_resume_command() {
+        let mut argv = vec!["claude".to_string(), "--dangerously-skip-permissions".to_string()];
+        let restore = super::resume_agent(&mut argv).expect("claude takes a session id");
+        assert_eq!(argv[1], "--session-id");
+        let id = argv[2].clone();
+        assert_eq!(id.len(), 36, "{id}");
+        assert_eq!(restore, vec!["claude".to_string(), "--resume".to_string(), id]);
+        assert_eq!(super::resume_agent(&mut argv), None, "not twice");
+    }
+
+    #[test]
+    fn other_programs_and_continuing_commands_are_left_alone() {
+        assert_eq!(super::resume_agent(&mut vec!["codex".to_string()]), None);
+        assert_eq!(super::resume_agent(&mut vec!["claude".to_string(), "--continue".to_string()]), None);
+        assert_eq!(
+            super::resume_agent(&mut vec!["/usr/bin/claude".to_string(), "--resume".to_string(), "x".to_string()]),
+            None
+        );
+    }
+
     #[test]
     fn a_long_output_keeps_whole_lines_from_its_end_even_mid_character() {
         let text = "é".repeat(30_000) + "\nlast line";
