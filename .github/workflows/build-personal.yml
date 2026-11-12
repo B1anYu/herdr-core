@@ -1,0 +1,82 @@
+# personal: builds this fork's hc for the machines it is deployed on and
+# uploads them as workflow artifacts. Upstream's release.yml publishes to
+# herdr.dev and signs with Azure; this one only builds the two targets we use.
+name: build personal
+
+on:
+  push:
+    branches: [mesh]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-personal-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, target: x86_64-unknown-linux-musl, runner: ubuntu-latest }
+          - { name: windows-x86_64, target: x86_64-pc-windows-msvc, runner: windows-2025 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: personal-${{ matrix.target }}-release
+          cache-workspace-crates: true
+          cache-bin: false
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p herdr-core
+      - name: Pack (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          bin=target/${{ matrix.target }}/release/herdr-core
+          "$bin" --version
+          file "$bin" | grep -q 'static' || { file "$bin"; echo "not static"; exit 1; }
+          mkdir -p dist
+          sh scripts/package "$bin" dist/herdr-core-${{ matrix.name }}-personal.tar.gz
+      - name: Pack (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/herdr-core.exe"
+          & $bin --version
+          if ($LASTEXITCODE) { throw "it does not run" }
+          New-Item -ItemType Directory -Force stage/THIRD-PARTY-NOTICES, dist | Out-Null
+          Copy-Item $bin stage/
+          Copy-Item LICENSE stage/
+          Copy-Item crates/herdr-core/THIRD-PARTY-NOTICES stage/THIRD-PARTY-NOTICES/herdr-core.txt
+          scripts/fetch-conpty.ps1 -Dest stage
+          Copy-Item distribution/windows/* stage/THIRD-PARTY-NOTICES/
+          tar -a -cf dist/herdr-core-${{ matrix.name }}-personal.zip -C stage herdr-core.exe conpty LICENSE THIRD-PARTY-NOTICES
+          if ($LASTEXITCODE) { throw "zip failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: herdr-core-${{ matrix.name }}-personal
+          path: dist/herdr-core-${{ matrix.name }}-personal.*
+          if-no-files-found: error
+          retention-days: 30
