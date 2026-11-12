@@ -759,7 +759,7 @@ fn mesh_env(here: &mut Session, lines: u32) {
 fn a_mesh_lists_a_machine_it_only_reaches_through_another() {
     let (far, mut mid, mut s) = (Session::new(), Session::new(), Session::new());
     // s adds mid; mid adds far. s has no way to far at all.
-    named_core(&mut s, "s");
+    named_core(&s, "s");
     s.env.push(fake_ssh(&s, &[("mid", &mid)]));
     let (_, mid_ssh) = fake_ssh(&mid, &[("far", &far)]);
     // `mid` runs under s's ssh script, so it names its own way to far: a
