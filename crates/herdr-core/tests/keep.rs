@@ -104,13 +104,63 @@ fn a_claude_run_through_hc_comes_back_to_its_conversation() {
     let argv: Vec<&str> = r["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert_eq!(argv[..2], ["claude", "--session-id"], "{r}");
     let id = argv[2].to_string();
-    assert_eq!(r["restore"], serde_json::json!(["claude", "--resume", id]));
+    let restore: Vec<&str> = r["restore"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(&restore[restore.len() - 3..], ["claude", "--resume", id.as_str()], "{r}");
     wait_until("it started", || text(&s, &t).contains("fake-claude"));
     let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap();
     unsafe {
         libc::kill(holder as i32, libc::SIGKILL);
     }
     wait_until("the conversation comes back", || text(&s, &t).contains(&format!("fake-claude --resume {id}")));
+}
+
+#[test]
+fn a_claude_typed_in_a_shell_comes_back_after_reboot_and_clears_when_exited() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut s = Session::new();
+    let home = s.root.join("home");
+    let bin = s.root.join("bin");
+    std::fs::create_dir_all(home.join(".claude/sessions")).unwrap();
+    std::fs::create_dir_all(home.join(".claude/projects/demo")).unwrap();
+    std::fs::write(home.join(".claude/projects/demo/54b28208-e4f6-4189-bb8b-5c0495fb71d4.jsonl"), "{}\n").unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '{\"pid\":%d,\"sessionId\":\"54b28208-e4f6-4189-bb8b-5c0495fb71d4\"}\\n' \"$$\" > \"$HOME/.claude/sessions/$$.json\"\n",
+            "echo shell-claude \"$@\"\n",
+            "trap 'exit 0' INT TERM\n",
+            "sleep 100\n",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    s.env.push(("HC_FOREGROUND_MS".into(), "30".into()));
+    s.env.push(("HOME".into(), home.display().to_string()));
+    s.env.push(("SHELL".into(), "/bin/sh".into()));
+    s.env.push(("PATH".into(), format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())));
+
+    // Plain shell tab, just like opening a tab and typing `claude -r` by hand.
+    let t = run(&s, &["--keep", "/bin/sh"]);
+    assert!(get(&s, &t)["restore"].is_null());
+    s.json(&["send", &t, "claude -r"]);
+    wait_until("foreground pid session tracked", || get(&s, &t)["restore"].is_array());
+
+    // Simulate a reboot (holder lost): keep should resume the exact conversation.
+    let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap();
+    unsafe {
+        libc::kill(holder as i32, libc::SIGKILL);
+    }
+    wait_until("conversation resumed in shell", || {
+        text(&s, &t).contains("shell-claude --resume 54b28208-e4f6-4189-bb8b-5c0495fb71d4")
+    });
+
+    // Exiting Claude returns to the interactive shell and clears `restore`.
+    s.json(&["interrupt", &t]);
+    wait_until("restore cleared on return to shell", || get(&s, &t)["restore"].is_null());
+    assert_eq!(get(&s, &t)["state"], "live");
 }
 
 #[test]

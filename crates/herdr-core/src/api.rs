@@ -34,7 +34,7 @@ mod types;
 use doc::*;
 mod waiting;
 use run::*;
-pub(crate) use run::{child_env, not_stopping, tail, terminal_env};
+pub(crate) use run::{child_env, not_stopping, shell_launch, tail, terminal_env};
 pub use types::*;
 use waiting::*;
 

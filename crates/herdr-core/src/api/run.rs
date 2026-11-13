@@ -257,35 +257,89 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
     env
 }
 
+/// `personal:` Wrap an agent's resume command in this machine's interactive
+/// shell, so login profiles (nvm, PATH) load first and exiting the agent drops
+/// into a live shell instead of ending the kept terminal.
+#[cfg(unix)]
+pub(crate) fn shell_launch(cmd: Vec<String>) -> Vec<String> {
+    let script = concat!(
+        "shell=${SHELL:-/bin/sh}\n",
+        "case \"${shell##*/}\" in\n",
+        "  fish) exec \"$shell\" -lic 'command $argv[2..]; exec $argv[1] -li' \"$shell\" \"$@\" ;;\n",
+        "  sh|bash|zsh|dash|ksh) exec \"$shell\" -lic '\"$@\"; exec \"$0\" -li' \"$shell\" \"$@\" ;;\n",
+        "  *) exec sh -c '\"$@\"; exec \"${SHELL:-sh}\" -i' sh \"$@\" ;;\n",
+        "esac"
+    );
+    let mut argv = vec!["sh".into(), "-c".into(), script.into(), "sh".into()];
+    argv.extend(cmd);
+    argv
+}
+
+#[cfg(windows)]
+pub(crate) fn shell_launch(cmd: Vec<String>) -> Vec<String> {
+    let mut sh = crate::platform::own_shell();
+    let line = format!(
+        "& {}",
+        cmd.iter()
+            .map(|w| {
+                let escaped = w.chars().fold(String::new(), |mut s, c| {
+                    s.push(c);
+                    if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+                        s.push(c);
+                    }
+                    s
+                });
+                format!("'{escaped}'")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if let Some(last) = sh.last_mut() {
+        last.push_str("; ");
+        last.push_str(&line);
+    }
+    sh
+}
+
 /// `personal:` Give Claude Code a conversation id at start, and return the
 /// command that resumes it. Anything already choosing a conversation (or not
 /// Claude at all) is left alone.
 fn resume_agent(argv: &mut Vec<String>) -> Option<Vec<String>> {
     let exe = argv.first()?.clone();
     let name = std::path::Path::new(&exe).file_name()?.to_str()?;
-    if name.strip_suffix(".exe").unwrap_or(name) != "claude" {
+    let stem = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".cmd")).unwrap_or(name);
+    if !stem.eq_ignore_ascii_case("claude") {
         return None;
     }
-    const CONTINUES: &[&str] = &["--session-id", "--resume", "--continue", "-c", "--from-pr", "--fork-session"];
+    const CONTINUES: &[&str] = &["--session-id", "--resume", "-r", "--continue", "-c", "--from-pr", "--fork-session"];
     if argv.iter().any(|a| CONTINUES.contains(&a.as_str())) {
         return None;
     }
     let id = uuid();
     argv.splice(1..1, ["--session-id".to_owned(), id.clone()]);
-    Some(vec![exe, "--resume".to_owned(), id])
+    let mut cmd = vec![exe, "--resume".to_owned(), id];
+    if argv.iter().any(|a| a == "--dangerously-skip-permissions") {
+        cmd.push("--dangerously-skip-permissions".to_owned());
+    }
+    Some(shell_launch(cmd))
 }
 
 /// `personal:` A version-4 UUID from the standard library alone.
 fn uuid() -> String {
     use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let now =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
     let mut a = std::collections::hash_map::RandomState::new().build_hasher();
     a.write_u128(now);
+    a.write_u64(seq);
     a.write_u32(std::process::id());
     let x = a.finish();
     let mut b = std::collections::hash_map::RandomState::new().build_hasher();
     b.write_u64(x);
+    b.write_u64(seq.rotate_left(31));
     b.write_u128(now.rotate_left(17));
     let y = b.finish();
     format!(
@@ -307,7 +361,9 @@ mod tests {
         assert_eq!(argv[1], "--session-id");
         let id = argv[2].clone();
         assert_eq!(id.len(), 36, "{id}");
-        assert_eq!(restore, vec!["claude".to_string(), "--resume".to_string(), id]);
+        let joined = restore.join(" ");
+        assert!(joined.contains("claude") && joined.contains("--resume") && joined.contains(&id), "{restore:?}");
+        assert!(joined.contains("--dangerously-skip-permissions"), "{restore:?}");
         assert_eq!(super::resume_agent(&mut argv), None, "not twice");
     }
 
@@ -315,6 +371,7 @@ mod tests {
     fn other_programs_and_continuing_commands_are_left_alone() {
         assert_eq!(super::resume_agent(&mut vec!["codex".to_string()]), None);
         assert_eq!(super::resume_agent(&mut vec!["claude".to_string(), "--continue".to_string()]), None);
+        assert_eq!(super::resume_agent(&mut vec!["claude".to_string(), "-r".to_string()]), None);
         assert_eq!(
             super::resume_agent(&mut vec!["/usr/bin/claude".to_string(), "--resume".to_string(), "x".to_string()]),
             None

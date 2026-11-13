@@ -155,6 +155,77 @@ fn shell_root(root: &Foreground) -> bool {
     matches!(name, "sh" | "bash" | "zsh" | "fish" | "nu" | "dash" | "ksh" | "tcsh")
 }
 
+fn program_stem(s: &str) -> &str {
+    let base = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    base.strip_suffix(".exe").or_else(|| base.strip_suffix(".cmd")).unwrap_or(base)
+}
+
+/// `personal:` Whether `fg` is an interactive Claude Code CLI process.
+fn is_claude(fg: &Foreground) -> bool {
+    program_stem(&fg.name).eq_ignore_ascii_case("claude")
+        || fg.argv.iter().take(2).any(|a| program_stem(a).eq_ignore_ascii_case("claude"))
+}
+
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `personal:` Read the live conversation id Claude Code writes to
+/// `~/.claude/sessions/<pid>.json` (falling back to `--session-id`/`--resume`
+/// in `argv` if no pid file is present), so even a `claude` typed inside an
+/// existing bash/PowerShell tab comes back to its exact conversation on reboot.
+fn claude_restore(fg: &Foreground) -> Option<Vec<String>> {
+    if !is_claude(fg) {
+        return None;
+    }
+    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| std::path::PathBuf::from(h).join(".claude"))
+    });
+    let from_pid_file = claude_dir.as_ref().and_then(|dir| {
+        let bytes = std::fs::read(dir.join("sessions").join(format!("{}.json", fg.pid))).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let id = v["sessionId"].as_str()?.to_owned();
+        if !valid_session_id(&id) {
+            return None;
+        }
+        let has_transcript = std::fs::read_dir(dir.join("projects"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|e| e.path().join(format!("{id}.jsonl")).is_file());
+        let flag = if has_transcript { "--resume" } else { "--session-id" };
+        Some((flag, id))
+    });
+    let (flag, id) = from_pid_file.or_else(|| {
+        let mut args = fg.argv.iter();
+        while let Some(arg) = args.next() {
+            if matches!(arg.as_str(), "--session-id" | "--resume" | "-r")
+                && let Some(val) = args.next()
+                && !val.starts_with('-')
+                && valid_session_id(val)
+            {
+                return Some(("--resume", val.clone()));
+            }
+        }
+        None
+    })?;
+    let exe = fg
+        .argv
+        .iter()
+        .take(2)
+        .find(|a| program_stem(a).eq_ignore_ascii_case("claude"))
+        .cloned()
+        .unwrap_or_else(|| "claude".into());
+    let mut cmd = vec![exe, flag.into(), id];
+    if fg.argv.iter().any(|a| a == "--dangerously-skip-permissions") {
+        cmd.push("--dangerously-skip-permissions".into());
+    }
+    Some(crate::api::shell_launch(cmd))
+}
+
 impl Core {
     /// Keeps every live terminal's `foreground` current, with an event on each change.
     pub async fn watch_foreground(self: Arc<Self>) {
@@ -165,22 +236,39 @@ impl Core {
             for id in live {
                 let pgid = self.foreground(id).await;
                 let now = (pgid > 0).then(|| about(pgid)).flatten();
+                let next_restore = now.as_ref().and_then(claude_restore);
                 let mut st = self.lock();
                 let Some(t) = st.reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
                     continue;
                 };
                 let at_shell = crate::platform::foreground_tracks_jobs()
                     && now.as_ref().is_some_and(|n| Some(n.pid as u32) == t.pid && shell_root(n));
+                let left_claude = t.foreground.as_ref().is_some_and(is_claude)
+                    && now.as_ref().is_some_and(|n| !is_claude(n) && Some(n.pid as u32) == t.pid);
                 let change = (at_shell && (t.status.is_some() || !t.records.is_empty())).then(|| {
                     t.first_task_turn = None;
                     crate::status::reset(t)
                 });
                 let foreground_changed = t.foreground != now;
+                let mut restore_changed = false;
+                if let Some(restore) = next_restore {
+                    if t.restore.as_ref() != Some(&restore) {
+                        t.restore = Some(restore);
+                        restore_changed = true;
+                    }
+                } else if ((at_shell && foreground_changed && t.foreground.is_some()) || left_claude)
+                    && t.restore.is_some()
+                {
+                    // `personal:` The person exited the agent back to their
+                    // shell: a later reboot should come back as a shell too.
+                    t.restore = None;
+                    restore_changed = true;
+                }
                 if let Some(f) = &now {
                     t.last_cwd = Some(f.cwd.clone());
                 }
                 t.foreground = now.clone();
-                if change.is_some() || foreground_changed {
+                if change.is_some() || foreground_changed || restore_changed {
                     self.save_soon();
                 }
                 if let Some(change) = change {
