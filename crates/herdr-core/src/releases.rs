@@ -22,11 +22,17 @@ pub struct Target {
     pub sha256: String,
 }
 
-fn base() -> String {
-    std::env::var("HERDR_RELEASES_URL")
-        .unwrap_or_else(|_| "https://releases.herdr.dev".into())
-        .trim_end_matches('/')
-        .into()
+fn base() -> Result<String, RpcError> {
+    // `personal:` Never pull stock upstream builds over this fork unless a
+    // caller or test explicitly points HERDR_RELEASES_URL at a release feed.
+    let url = std::env::var("HERDR_RELEASES_URL").map_err(|_| {
+        RpcError::new(
+            "refused",
+            "this personal build does not update from releases.herdr.dev",
+            "build from the mesh branch and run hc update --from <binary>",
+        )
+    })?;
+    Ok(url.trim_end_matches('/').into())
 }
 
 fn unavailable(why: String) -> RpcError {
@@ -49,9 +55,10 @@ fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
 
 /// The latest release's list, or one version's.
 pub fn manifest(version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcError> {
+    let base = base()?;
     let url = match version {
-        Some(v) => format!("{}/core/{v}/manifest.json", base()),
-        None => format!("{}/core/latest.json", base()),
+        Some(v) => format!("{base}/core/{v}/manifest.json"),
+        None => format!("{base}/core/latest.json"),
     };
     let file = scratch.join("manifest.json");
     curl(&url, &file)?;

@@ -147,3 +147,11 @@ fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
         "no leftovers"
     );
 }
+
+#[test]
+fn bare_update_without_a_release_feed_refuses_to_overwrite_the_personal_build() {
+    let s = Session::new();
+    let (_, e) = s.err(&["--json", "update"]);
+    assert_eq!(e["error"]["kind"], "refused", "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("personal build"), "{e}");
+}
