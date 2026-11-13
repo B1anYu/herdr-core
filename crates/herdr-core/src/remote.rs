@@ -255,6 +255,7 @@ pub fn forget(core: &Core, st: &mut State, id: &str) {
     if let Some(task) = st.line_tasks.remove(id) {
         task.abort();
     }
+    st.mesh.retain(|e| e.next != NextHop::Machine(id.to_owned()));
     // Viewers waiting for it won't get it back.
     let waiting: Vec<(usize, u32)> = st.relayed.iter().filter(|(_, r)| r.machine == id).map(|(k, _)| *k).collect();
     for key in waiting {
@@ -893,6 +894,16 @@ impl To {
             To::Peer { .. } => None,
         }
     }
+
+    /// `personal:` The outbound machine line `terminal.attach` can open a
+    /// stream on (`To::Peer` is an inbound line and carries no attach streams).
+    pub fn attach_machine(&self) -> Option<Machine> {
+        match self {
+            To::Machine(m) => Some(m.clone()),
+            To::Mesh(inner) => inner.attach_machine(),
+            To::Peer { .. } => None,
+        }
+    }
 }
 
 /// `personal:` The neighbor a mesh entry is reached through.
@@ -917,6 +928,7 @@ pub struct MeshEntry {
 /// name stored is the one that neighbor uses, so a prefix made here means the
 /// same machine there.
 pub fn learn_mesh(core: &Core, st: &mut State, hop: NextHop, views: &[Value]) {
+    st.mesh.retain(|e| e.next != hop);
     for v in views {
         let (Some(id), Some(name)) = (v["id"].as_str(), v["name"].as_str()) else { continue };
         if id == core.info.id {

@@ -493,12 +493,17 @@ async fn handle(
     let params = crate::remote::from_peer(core, conn, request["params"].clone());
     let result = match crate::remote::route(core, conn, method, &params).await {
         _ if method == "$/orphaned" => crate::remote::orphaned(core, conn, &params).await,
-        Ok(Some((crate::remote::To::Machine(machine), params))) if method == "terminal.attach" => match conn {
-            Some(conn) => crate::remote::attach(core, conn, &machine, params).await,
-            None => Err(RpcError::new(
+        Ok(Some((to, params))) if method == "terminal.attach" => match (to.attach_machine(), conn) {
+            (Some(machine), Some(conn)) => crate::remote::attach(core, conn, &machine, params).await,
+            (Some(_), None) => Err(RpcError::new(
                 "needs_framed",
                 "attach needs a framed connection",
                 "send hello with framed: true first, or use `hc attach`",
+            )),
+            (None, _) => Err(RpcError::new(
+                "unavailable",
+                "cannot attach through an inbound peer line",
+                "add that machine directly with `hc machine add` to attach a viewer",
             )),
         },
         Ok(Some((to, params))) => crate::remote::forward_to(core, &to, method, params).await,
